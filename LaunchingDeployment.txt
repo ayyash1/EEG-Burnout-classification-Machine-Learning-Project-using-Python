@@ -1,0 +1,187 @@
+python -m streamlit run "d:\Computer Engineering\Academics\6th Semester\ML LAB\Project\Code Files\Final\ModelDeployment.py"
+
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import LabelEncoder
+from scipy.stats import skew, kurtosis
+import joblib
+import re
+
+# ----------------------------------------
+# Function: Convert timestamp to seconds
+# ----------------------------------------
+def timestamp_to_seconds(ts):
+    try:
+        if isinstance(ts, str) and re.match(r'\d{1,2}:\d{2}\.\d+', ts):
+            m, s_ms = ts.split(':')
+            s, ms = s_ms.split('.')
+            return int(m) * 60 + int(s) + int(ms) / 1000
+        return None
+    except:
+        return None
+
+# ----------------------------------------
+# Function: Feature Extraction
+# ----------------------------------------
+def extract_features(segment_df, columns_to_extract):
+    features = {}
+    for channel in columns_to_extract:
+        signal = pd.to_numeric(segment_df[channel], errors='coerce').dropna().values
+
+        if len(signal) == 0:
+            features[f'{channel}_mean'] = 0
+            features[f'{channel}_std'] = 0
+            features[f'{channel}_skew'] = 0
+            features[f'{channel}_kurt'] = 0
+            features[f'{channel}_zcr'] = 0
+            features[f'{channel}_line_length'] = 0
+            features[f'{channel}_hjorth_activity'] = 0
+            features[f'{channel}_hjorth_mobility'] = 0
+            features[f'{channel}_hjorth_complexity'] = 0
+            continue
+
+        features[f'{channel}_mean'] = np.mean(signal)
+        features[f'{channel}_std'] = np.std(signal)
+        features[f'{channel}_skew'] = skew(signal)
+        features[f'{channel}_kurt'] = kurtosis(signal)
+        features[f'{channel}_zcr'] = np.sum(np.diff(np.sign(signal)) != 0)
+        features[f'{channel}_line_length'] = np.sum(np.abs(np.diff(signal)))
+
+        activity = np.var(signal)
+        features[f'{channel}_hjorth_activity'] = activity
+
+        derivative = np.diff(signal)
+        mobility = np.sqrt(np.var(derivative) / activity) if activity != 0 else 0
+        features[f'{channel}_hjorth_mobility'] = mobility
+
+        complexity = (
+            np.sqrt(np.var(np.diff(derivative)) / np.var(derivative)) / mobility
+            if np.var(derivative) != 0 and mobility != 0 else 0
+        )
+        features[f'{channel}_hjorth_complexity'] = complexity
+
+    return features
+
+# ----------------------------------------
+# Function: Preprocess and Segment EEG
+# ----------------------------------------
+def preprocess_and_extract_features(file):
+    eeg_columns = [
+        'TimeStamp', 'Delta_TP9', 'Delta_AF7', 'Delta_AF8', 'Delta_TP10',
+        'Theta_TP9', 'Theta_AF7', 'Theta_AF8', 'Theta_TP10',
+        'Alpha_TP9', 'Alpha_AF7', 'Alpha_AF8', 'Alpha_TP10',
+        'Beta_TP9', 'Beta_AF7', 'Beta_AF8', 'Beta_TP10',
+        'Gamma_TP9', 'Gamma_AF7', 'Gamma_AF8', 'Gamma_TP10',
+        'RAW_TP9', 'RAW_AF7', 'RAW_AF8', 'RAW_TP10',
+        'AUX_RIGHT', 'Accelerometer_X', 'Accelerometer_Y', 'Accelerometer_Z',
+        'Gyro_X', 'Gyro_Y', 'Gyro_Z', 'HeadBandOn',
+        'HSI_TP9', 'HSI_AF7', 'HSI_AF8', 'HSI_TP10',
+        'Gender', 'Burnout'
+    ]
+    df = pd.read_csv(file, header=None, names=eeg_columns)
+    df = df.dropna().drop_duplicates()
+
+    df['TimeInSeconds'] = df['TimeStamp'].apply(timestamp_to_seconds)
+    df = df.dropna(subset=['TimeInSeconds'])
+
+    eeg_signal_columns = ['RAW_AF7', 'RAW_AF8', 'RAW_TP9', 'RAW_TP10']
+    df[eeg_signal_columns] = df[eeg_signal_columns].apply(pd.to_numeric, errors='coerce')
+    df = df.dropna(subset=eeg_signal_columns)
+
+    start_time = df['TimeInSeconds'].min()
+    end_time = df['TimeInSeconds'].max()
+
+    segment_duration = 10
+    features = []
+    current_start = start_time
+
+    while current_start + segment_duration <= end_time:
+        segment_df = df[(df['TimeInSeconds'] >= current_start) & (df['TimeInSeconds'] < current_start + segment_duration)]
+        if len(segment_df) >= 100:
+            segment_features = extract_features(segment_df, eeg_signal_columns)
+            features.append(segment_features)
+        current_start += segment_duration
+
+    return pd.DataFrame(features)
+
+# ----------------------------------------
+# Function: Load Model Safely
+# ----------------------------------------
+def load_model():
+    model_path = "D:\\Computer Engineering\\Academics\\6th Semester\\ML LAB\\Project\\Code Files\\Final\\eeg_burnout_model_rf.pkl"  # Keep the model in the same folder as this script
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at: {model_path}")
+    return joblib.load(model_path)
+
+# ----------------------------------------
+# Function: Burnout Level Advice
+# ----------------------------------------
+def burnout_advice(level):
+    if level == 'Low':
+        return "✅ You're in a healthy state. Keep balancing work, rest, and play!"
+    elif level == 'Medium':
+        return "⚠️ You're at risk. Monitor your workload and consider relaxation techniques."
+    elif level == 'High':
+        return "🚨 Dangerous burnout level! Take immediate steps to rest, disconnect, and seek support if needed."
+    else:
+        return "Unknown status."
+
+# ----------------------------------------
+# STREAMLIT UI START
+# ----------------------------------------
+def main():
+    st.set_page_config(page_title="EEG Burnout Detector", layout="centered")
+
+    st.markdown("<h1 style='text-align: center; color: #6C63FF;'>🧠 EEG Burnout Classification App</h1>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    uploaded_file = st.file_uploader("📤 Upload your EEG CSV file", type="csv")
+
+    if uploaded_file is not None:
+        try:
+            features_df = preprocess_and_extract_features(uploaded_file)
+
+            if features_df.empty:
+                st.warning("⚠️ No valid EEG segments found.")
+                return
+
+            model = load_model()
+            predictions = model.predict(features_df)
+
+            # Majority vote for overall burnout prediction
+            label_map = {0: 'Low', 1: 'Medium', 2: 'High'}
+            final_label = pd.Series(predictions).mode()[0]
+            burnout_level = label_map.get(final_label, "Unknown")
+
+            # Color and message based on level
+            color_map = {
+                'Low': '#D4EDDA',
+                'Medium': '#FFF3CD',
+                'High': '#F8D7DA'
+            }
+            text_color = {
+                'Low': '#155724',
+                'Medium': '#856404',
+                'High': '#721C24'
+            }
+
+            st.markdown(f"""
+                <div style="background-color:{color_map[burnout_level]}; padding:20px; border-radius:10px;">
+                    <h2 style="color:{text_color[burnout_level]}; text-align:center;">Burnout Level: {burnout_level}</h2>
+                    <p style="color:{text_color[burnout_level]}; text-align:center;">{burnout_advice(burnout_level)}</p>
+                </div>
+            """, unsafe_allow_html=True)
+
+        except Exception as e:
+            st.error(f"⚠️ Error during processing: {e}")
+
+# ----------------------------------------
+# Run Streamlit App
+# ----------------------------------------
+if __name__ == "__main__":
+    main()
+
+
